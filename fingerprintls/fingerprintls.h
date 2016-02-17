@@ -33,7 +33,11 @@ mistakes, kthnxbai.
 /* Max hostname length */
 #define HOST_NAME_MAX 255
 
-#define FPSHARD 32
+/*
+	Because I'm going quick and dirty on the hashing algorithm, the number of shards
+	has to be an all 1's number in binary (2, 4, 8, etc).
+*/
+#define SHARDNUM 4
 
 
 /* Ethernet addresses are 6 bytes */
@@ -205,6 +209,7 @@ FILE *json_fd = NULL;
 FILE *fpdb_fd = NULL;
 struct fingerprint_new *search[8][4];
 char hostname[HOST_NAME_MAX];			/* store the hostname once to save multiple lookups */
+u_int8_t shard, my_shard;                   /* Shard number for distributing between worker processes */
 
 
 /* These were in main, but this let's the signal handler close as needed */

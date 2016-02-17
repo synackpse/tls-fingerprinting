@@ -3,8 +3,11 @@
 
 // XXX reuse alloc'd space
 
-
-uint shardnum (uint16_t port1, uint16_t port2, uint16_t maxshard) {
+/*
+	Because I'm going quick and dirty on the hashing algorithm, the number of shards
+	has to be an all 1's number in binary (2, 4, 8, etc).
+*/
+uint shard_num (uint16_t port1, uint16_t port2, uint16_t maxshard) {
 				return (((port1 >> 8) + (port2 >> 8)) & (maxshard - 1));
 }
 
@@ -123,7 +126,6 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 		switch(ntohs(ethernet->ether_type)){
 			case ETHERTYPE_IP:
 				/* IPv4 */
-				printf("v4\n");
 				ip_version=4;
 				af_type=AF_INET;
 				break;
@@ -253,6 +255,17 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 		*/
 		/* Yay, it's TCP, let's set the pointer */
 		tcp = (struct tcp_header*)(packet + SIZE_ETHERNET + size_vlan_offset + size_ip);
+
+		/* IS THIS MY SHARD? */
+		if(shard_num(tcp->th_sport, tcp->th_dport, SHARDNUM) == my_shard) {
+			//printf("Mine: %i\n", my_shard);
+		} else {
+			//printf("Someone Else %i\n", my_shard);
+			return;
+		}
+
+
+
 
 		size_tcp = (tcp->th_off * 4);
 		if (size_tcp < 20) {

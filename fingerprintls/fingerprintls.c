@@ -55,6 +55,9 @@ mistakes, kthnxbai.
 /* And my own signal handler functions */
 #include "signal.c"
 
+/* To allow the use of mmap when forking */
+#include <sys/mman.h>
+
 /* My own header sherbizzle */
 #include "fingerprintls.h"
 
@@ -88,6 +91,7 @@ uint shard_fp (struct fingerprint_new *fp_lookup, uint16_t maxshard) {
 int main(int argc, char **argv) {
 
 	char *dev = NULL;											/* capture device name */
+	char *pcap_file = NULL;
 	char *unpriv_user = NULL;							/* User for dropping privs */
 	char errbuf[PCAP_ERRBUF_SIZE];				/* error buffer */
 	extern pcap_t *handle;								/* packet capture handle */
@@ -123,22 +127,24 @@ int main(int argc, char **argv) {
 			case 'p':
 				/* Open the file */
 				/* Check if interface already set */
-				if (handle != NULL) {
-					printf("-p and -i are mutually exclusive\n");
-					exit(-1);
-				}
-				handle = pcap_open_offline(argv[++i], errbuf);
-				printf("Reading from file: %s\n", argv[i]);
+				//if (dev != NULL) {
+				//	printf("-p and -i are mutually exclusive\n");
+				//	exit(-1);
+				//}
+				//handle = pcap_open_offline(argv[++i], errbuf);
+				//printf("Reading from file: %s\n", argv[i]);
+				pcap_file = argv[++i];
 				break;
 			case 'i':
 				/* Open the interface */
 				/* Check if file already successfully opened, if bad filename we can fail to sniffing */
-				if (handle != NULL) {
-					printf("-p and -i are mutually exclusive\n");
-					exit(-1);
-				}
-				handle = pcap_open_live(argv[++i], SNAP_LEN, 1, 1000, errbuf);
-				printf("Using interface: %s\n", argv[i]);
+				//if (handle != NULL) {
+				//	printf("-p and -i are mutually exclusive\n");
+				//	exit(-1);
+				//}
+				dev = argv[++i];
+				//handle = pcap_open_live(argv[++i], SNAP_LEN, 1, 1000, errbuf);
+				//printf("Using interface: %s\n", argv[i]);
 				break;
 			case 'j':
 				/* JSON output to file */
@@ -180,7 +186,70 @@ int main(int argc, char **argv) {
 		}
 	}
 
+
+
+
+	/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
+	/* FORKING HERE, GET THINGS BEFORE & AFTER CORRECT */
+	/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
+
+	/*
+		This is probably not the most efficient loop, but I'm trying to get 1 parent an X children.
+		Did not want children of children, etc.  I will refine later but am generally considering
+		initialisation phase to be performance critical and this isn't totally insane.
+	*/
+
+	extern u_int8_t shard, my_shard;
+	u_int8_t pid;
+
+	fprintf(stdout, "Starting %i working processes\n", SHARDNUM);
+
+	for(shard = 0 ; shard < SHARDNUM ; shard++) {
+		if (shard == 0 || pid != 0) {
+			my_shard = shard;
+			pid = fork();
+			if(pid != 0)
+				my_shard = SHARDNUM;
+		} else {
+			break;
+		}
+
+	}
+	printf("Started Shard: %i %i\n", my_shard, pid);
+	/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
+
+	// XXX Parent process is not in the "shard pool" so will never recieve a packet.  Thus should not go pcap_loop
+
+
 	/* Checks required directly after switches are set */
+	if ((dev != NULL) && (pcap_file != NULL)) {
+		printf("-p and -i are mutually exclusive\n");
+		exit(-1);
+	}
+
+	if(dev != NULL) {
+		printf("Debug 1\n");
+		handle = pcap_open_live(dev, SNAP_LEN, 1, 1000, errbuf);
+		if(handle == NULL) {
+			printf("[%i] Error opening %s\n",my_shard , dev);
+			printf("[%i] '%s'\n",my_shard , errbuf);
+			return 0;
+		} else {
+			printf("[%i] Using interface: %s\n",my_shard , dev);
+		}
+	}
+
+	if (pcap_file != NULL) {
+		printf("Debug 2\n");
+		handle = pcap_open_offline(pcap_file, errbuf);
+		if(handle == NULL) {
+			printf("[%i] Error opening %s\n",my_shard , pcap_file);
+			printf("[%i] '%s'\n",my_shard , errbuf);
+			return 0;
+		} else {
+			printf("[%i] Using pcapfile: %s\n", my_shard, pcap_file);
+		}
+	}
 
 	/* Fingerprint DB to load */
 	/* This needs to be before the priv drop in case the fingerprint db requires root privs to read */
@@ -374,13 +443,22 @@ int main(int argc, char **argv) {
 	}
 
 	/* now we can set our callback function */
-	pcap_loop(handle, -1, got_packet, NULL);
+	if(my_shard != SHARDNUM) {
+		pcap_loop(handle, -1, got_packet, NULL);
 
-	fprintf(stderr, "Reached end of pcap\n");
+		fprintf(stderr, "Reached end of pcap\n");
 
-	/* cleanup */
-	pcap_freecode(&fp);
-	pcap_close(handle);
+		/* cleanup */
+		pcap_freecode(&fp);
+		pcap_close(handle);
+
+	} else {
+		/* Placeholder as parent process does not do pcap shard pool fun */
+		while(1) {
+			sleep(5);
+		}
+	}
+
 
 	return 0;
 }
