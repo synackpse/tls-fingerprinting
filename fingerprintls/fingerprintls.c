@@ -28,8 +28,6 @@ mistakes, kthnxbai.
 // XXX Add UDP support (not as easy as I thought, DTLS has differences... still add it though)
 // XXX enhance search to include sorting per list/thread/shard/thingy
 // XXX add 6in4 support (should be as simple as UDP and IPv6... in theory)
-// XXX add Teredo support
-
 
 
 #include <pcap.h>
@@ -55,14 +53,16 @@ mistakes, kthnxbai.
 /* And my own signal handler functions */
 #include "signal.c"
 
-/* To allow the use of mmap when forking */
-#include <sys/mman.h>
-
 /* My own header sherbizzle */
 #include "fingerprintls.h"
 
+/* Pthread stuff */
+#include <pthread.h>
+#include "pthread.c"
+
 /* Stuff to process packets */
 #include "packet_processing.c"
+
 
 
 /*
@@ -108,6 +108,9 @@ int main(int argc, char **argv) {
 	extern char hostname[HOST_NAME_MAX];
 	show_drops = 0;
 
+	/* Threads */
+	extern struct pthread_config *pthread_config_ptr;
+
 
 	/* Make sure pipe sees new packets unbuffered. */
 	setvbuf(stdout, (char *)NULL, _IOLBF, 0);
@@ -125,26 +128,10 @@ int main(int argc, char **argv) {
 				exit(0);
 				break;
 			case 'p':
-				/* Open the file */
-				/* Check if interface already set */
-				//if (dev != NULL) {
-				//	printf("-p and -i are mutually exclusive\n");
-				//	exit(-1);
-				//}
-				//handle = pcap_open_offline(argv[++i], errbuf);
-				//printf("Reading from file: %s\n", argv[i]);
 				pcap_file = argv[++i];
 				break;
 			case 'i':
-				/* Open the interface */
-				/* Check if file already successfully opened, if bad filename we can fail to sniffing */
-				//if (handle != NULL) {
-				//	printf("-p and -i are mutually exclusive\n");
-				//	exit(-1);
-				//}
 				dev = argv[++i];
-				//handle = pcap_open_live(argv[++i], SNAP_LEN, 1, 1000, errbuf);
-				//printf("Using interface: %s\n", argv[i]);
 				break;
 			case 'j':
 				/* JSON output to file */
@@ -176,7 +163,6 @@ int main(int argc, char **argv) {
 					printf("Cannot open fingerprint database file\n");
 					exit(-1);
 				}
-
 				break;
 			default :
 				printf("Unknown option '%s'\n", argv[i]);
@@ -186,79 +172,147 @@ int main(int argc, char **argv) {
 		}
 	}
 
-
-
-
-	/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
-	/* FORKING HERE, GET THINGS BEFORE & AFTER CORRECT */
-	/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
-
 	/*
-		This is probably not the most efficient loop, but I'm trying to get 1 parent an X children.
-		Did not want children of children, etc.  I will refine later but am generally considering
-		initialisation phase to be performance critical and this isn't totally insane.
+		Fingerprint DB to load
+		This needs to be before the priv drop in case the fingerprint db requires root privs to read.
 	*/
-
-	extern u_int8_t shard, my_shard;
-	u_int8_t pid;
-
-	fprintf(stdout, "Starting %i working processes\n", SHARDNUM);
-
-	for(shard = 0 ; shard < SHARDNUM ; shard++) {
-		if (shard == 0 || pid != 0) {
-			my_shard = shard;
-			pid = fork();
-			if(pid != 0)
-				my_shard = SHARDNUM;
-		} else {
-			break;
-		}
-
-	}
-	printf("Started Shard: %i %i\n", my_shard, pid);
-	/* XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX */
-
-	// XXX Parent process is not in the "shard pool" so will never recieve a packet.  Thus should not go pcap_loop
-
-
-	/* Checks required directly after switches are set */
-	if ((dev != NULL) && (pcap_file != NULL)) {
-		printf("-p and -i are mutually exclusive\n");
-		exit(-1);
-	}
-
-	if(dev != NULL) {
-		printf("Debug 1\n");
-		handle = pcap_open_live(dev, SNAP_LEN, 1, 1000, errbuf);
-		if(handle == NULL) {
-			printf("[%i] Error opening %s\n",my_shard , dev);
-			printf("[%i] '%s'\n",my_shard , errbuf);
-			return 0;
-		} else {
-			printf("[%i] Using interface: %s\n",my_shard , dev);
-		}
-	}
-
-	if (pcap_file != NULL) {
-		printf("Debug 2\n");
-		handle = pcap_open_offline(pcap_file, errbuf);
-		if(handle == NULL) {
-			printf("[%i] Error opening %s\n",my_shard , pcap_file);
-			printf("[%i] '%s'\n",my_shard , errbuf);
-			return 0;
-		} else {
-			printf("[%i] Using pcapfile: %s\n", my_shard, pcap_file);
-		}
-	}
-
-	/* Fingerprint DB to load */
-	/* This needs to be before the priv drop in case the fingerprint db requires root privs to read */
 	if(fpdb_fd == NULL) {
 		/* No filename set, trying the current directory */
 		if((fpdb_fd = fopen("tlsfp.db", "r")) == NULL) {
 			printf("Cannot open fingerprint database file (try -f)\n");
 			printf("(This is a new feature, tlsfp.db should be in the source code directory)\n");
 			exit(-1);
+		}
+	}
+
+	/*
+		Checks required directly after switches are set
+	*/
+	if ((dev != NULL) && (pcap_file != NULL)) {
+		printf("-p and -i are mutually exclusive\n");
+		exit(-1);
+	}
+
+	/*
+		setup hostname variable for use in logs (incase of multiple hosts)
+		This is set so early incase first packet to first thread is unknown signature.
+	*/
+	extern char hostname[HOST_NAME_MAX];
+	if(gethostname(hostname, HOST_NAME_MAX) != 0) {
+		sprintf(hostname, "unknown");
+	}
+
+	/*
+		Need something in place before the threads spin up
+		XXX need to block them until FPDB loaded before this is commit'd
+	*/
+	int x, y;
+	struct fingerprint_new *fp_current;
+	extern struct fingerprint_new *search[8][4];
+
+	/* Initialise so that we know when we are on the first in any one chain */
+	for (x = 0 ; x < 8 ; x++) {
+		for (y = 0 ; y < 4 ; y++) {
+			search[x][y] = NULL;
+			//pthread_mutex_init(&search[x][y]->fpdb_mutex, NULL);
+		}
+	}
+
+
+	/*
+		Setup a worker thread per "shard", and perform some per-thread activities
+	*/
+	struct pthread_config *working_pthread_config;
+	extern struct pthread_config *next_thread_config;
+	working_pthread_config = pthread_config_ptr = calloc(1, sizeof(struct pthread_config));
+	long pt;
+
+	/* Initialise the Mutexs before the threads start */
+	extern pthread_mutex_t log_mutex;
+	extern pthread_mutex_t json_mutex;
+	extern pthread_mutex_t fpdb_mutex;
+	pthread_mutex_init(&log_mutex, NULL);
+	pthread_mutex_init(&json_mutex, NULL);
+	pthread_mutex_init(&fpdb_mutex, NULL);
+
+	for (i = 0; i < SHARDNUM ; i++) {
+		working_pthread_config->threadnum = i;
+		pthread_mutex_init(&working_pthread_config->thread_mutex, NULL);
+		pthread_mutex_lock(&working_pthread_config->thread_mutex);
+
+		/*
+			Setup the pcap readeerererering stuff
+		*/
+		if(dev != NULL) {
+			if (i == 0) {
+				/*
+					First thread will set the NIC into promisc mode
+				*/
+  			working_pthread_config->handle = pcap_open_live(dev, SNAP_LEN, 1, 1000, errbuf);
+			} else {
+				/*
+					other threads can just sniff without promisc thanks to thread 0
+				*/
+  			working_pthread_config->handle = pcap_open_live(dev, SNAP_LEN, 0, 1000, errbuf);
+			}
+
+			if(working_pthread_config->handle == NULL) {
+				printf("Error opening %s\n",dev);
+				printf("'%s'\n",errbuf);
+				return 0;
+			} else {
+				printf("Using interface: %s\n",dev);
+			}
+		}
+
+		if (pcap_file != NULL) {
+			working_pthread_config->handle = pcap_open_offline(pcap_file, errbuf);
+			if(working_pthread_config->handle == NULL) {
+				printf("Error opening %s\n",pcap_file);
+				printf("'%s'\n",errbuf);
+				return 0;
+			} else {
+				printf("Using pcapfile: %s\n",pcap_file);
+			}
+		}
+		/* *********************************** */
+
+		/*
+			make sure we're capturing on an Ethernet device [2]
+		*/
+		if (pcap_datalink(working_pthread_config->handle) != DLT_EN10MB) {
+			fprintf(stderr, "%s is not an Ethernet\n", dev);
+			exit(EXIT_FAILURE);
+		}
+
+		/*
+			compile the filter expression
+			netmask is set to 0 because we don't care and it saves looking it up :)
+		*/
+		if (pcap_compile(working_pthread_config->handle, &fp, default_filter, 0, 0) == -1) {
+			fprintf(stderr, "Couldn't parse filter %s: %s\n",
+					filter_exp, pcap_geterr(handle));
+			exit(EXIT_FAILURE);
+		}
+
+		/*
+			apply the compiled filter
+		*/
+		pt = pthread_create(&working_pthread_config->thread_handle, NULL, packet_pthread, (void *)i);
+		if (pcap_setfilter(working_pthread_config->handle, &fp) == -1) {
+			fprintf(stderr, "Couldn't install filter %s: %s\n",
+					filter_exp, pcap_geterr(handle));
+			exit(EXIT_FAILURE);
+		}
+
+		/*
+			Allocate the next thread config for the next loop around
+		*/
+		if(i < (SHARDNUM-1)) {
+        working_pthread_config->next = calloc(1, sizeof(struct pthread_config));
+        working_pthread_config = working_pthread_config->next;
+		} else {
+        working_pthread_config->next = pthread_config_ptr;
 		}
 
 	}
@@ -279,15 +333,6 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	// Register signal Handlers
-	if(!(register_signals())) {
-		printf("Could not register signal handlers\n");
-		exit(0);
-	}
-
-
-	/* XXX Temporary home, but need to test as early in the cycle as possible for now */
-	/* Load binary rules blob and parse */
 
 	/* XXX This if can go when this is "the way" */
 	if(fpdb_fd != NULL) {
@@ -316,17 +361,7 @@ int main(int argc, char **argv) {
 		exit(-1);
 	}
 
-	int x, y;
-	//extern struct fingerprint_new *fp_first;
-	struct fingerprint_new *fp_current;
-	extern struct fingerprint_new *search[8][4];
 
-	/* Initialise so that we know when we are on the first in any one chain */
-	for (x = 0 ; x < 8 ; x++) {
-		for (y = 0 ; y < 4 ; y++) {
-			search[x][y] = NULL;
-		}
-	}
 
 	/* Filesize -1 because of the header, loops through the file, one loop per fingerprint */
 	for (x = 0 ; x < (filesize-1) ; fp_count++) {
@@ -401,7 +436,12 @@ int main(int argc, char **argv) {
 
 	printf("Loaded %i signatures\n", fp_count);
 
-	/* XXX END TESTING OF BINARY RULES */
+
+	// Register signal Handlers
+	if(!(register_signals())) {
+		printf("Could not register signal handlers\n");
+		exit(0);
+	}
 
 	/* XXX HORRIBLE HORRIBLE KLUDGE TO AVOID if's everywhere.  I KNOW OK?! */
 	if(json_fd == NULL) {
@@ -411,53 +451,25 @@ int main(int argc, char **argv) {
 		}
 	}
 
-	if (handle == NULL) {
-		fprintf(stderr, "Couldn't open source %s: %s\n", dev, errbuf);
-		exit(EXIT_FAILURE);
+	/*
+		Unlock threads and let them run....
+	*/
+	working_pthread_config = pthread_config_ptr;
+	for (i = 0; i < SHARDNUM ; working_pthread_config = working_pthread_config->next) {
+		pthread_mutex_unlock(&working_pthread_config->thread_mutex);
 	}
 
-	/* make sure we're capturing on an Ethernet device [2] */
-	if (pcap_datalink(handle) != DLT_EN10MB) {
-		fprintf(stderr, "%s is not an Ethernet\n", dev);
-		exit(EXIT_FAILURE);
+	// XXX Temp holder for threading fun
+	while(1) {
+		sleep(60);
 	}
 
-	/* compile the filter expression */
-	/* netmask is set to 0 because we don't care and it saves looking it up :) */
-	if (pcap_compile(handle, &fp, default_filter, 0, 0) == -1) {
-		fprintf(stderr, "Couldn't parse filter %s: %s\n",
-		    filter_exp, pcap_geterr(handle));
-		exit(EXIT_FAILURE);
-	}
+	fprintf(stderr, "Reached end of pcap\n");
 
-	/* apply the compiled filter */
-	if (pcap_setfilter(handle, &fp) == -1) {
-		fprintf(stderr, "Couldn't install filter %s: %s\n",
-		    filter_exp, pcap_geterr(handle));
-		exit(EXIT_FAILURE);
-	}
+	/* cleanup */
+	pcap_freecode(&fp);
+	pcap_close(handle);
 
-	/* setup hostname variable for use in logs (incase of multiple hosts) */
-	if(gethostname(hostname, HOST_NAME_MAX) != 0) {
-		sprintf(hostname, "unknown");
-	}
-
-	/* now we can set our callback function */
-	if(my_shard != SHARDNUM) {
-		pcap_loop(handle, -1, got_packet, NULL);
-
-		fprintf(stderr, "Reached end of pcap\n");
-
-		/* cleanup */
-		pcap_freecode(&fp);
-		pcap_close(handle);
-
-	} else {
-		/* Placeholder as parent process does not do pcap shard pool fun */
-		while(1) {
-			sleep(5);
-		}
-	}
 
 
 	return 0;

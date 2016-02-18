@@ -1,3 +1,30 @@
+/*
+Exciting Licence Info.....
+
+This file is part of FingerprinTLS.
+
+FingerprinTLS is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+FingerprinTLS is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Foobar.  If not, see <http://www.gnu.org/licenses/>.
+
+Exciting Licence Info Addendum.....
+
+FingerprinTLS is additionally released under the "don't judge me" program
+whereby it is forbidden to rip into me too harshly for programming
+mistakes, kthnxbai.
+
+*/
+
+
 // XXX as expected there is a memory leak, because I've been a bit yeeehaw with malloc in doing this test
 // check through the code to make sure mallocs and frees are all matched up. (may be fixed?)
 
@@ -5,7 +32,7 @@
 
 /*
 	Because I'm going quick and dirty on the hashing algorithm, the number of shards
-	has to be an all 1's number in binary (2, 4, 8, etc).
+	has to be an nice binary number (2, 4, 8, 16, etc).
 */
 uint shard_num (uint16_t port1, uint16_t port2, uint16_t maxshard) {
 				return (((port1 >> 8) + (port2 >> 8)) & (maxshard - 1));
@@ -39,12 +66,12 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 		struct tm print_time;
 		char printable_time[64];
 
-		struct fingerprint_new *fp_nav;			/* For navigating the fingerprint database */
+		struct fingerprint_new *fp_nav;
 		static struct fingerprint_new *fp_packet = NULL;			/* Generated fingerprint for incoming packet */
 		static uint16_t	extensions_malloc = 0;							/* how much is currently allocated for the extensions field */
 
 		/* pointers to key places in the packet headers */
-		struct ether_header *ethernet;	/* The ethernet header [1] */
+		struct ether_header *ethernet;		/* The ethernet header [1] */
 		struct ipv4_header *ipv4;         /* The IPv4 header */
 		struct ip6_hdr *ipv6;             /* The IPv6 header */
 		struct tcp_header *tcp;           /* The TCP header */
@@ -55,6 +82,10 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 		u_char *payload;                  /* Packet payload */
 
 		char *server_name;						/* Server name per the extension */
+
+		extern pthread_mutex_t log_mutex;
+		extern pthread_mutex_t json_mutex;
+		extern pthread_mutex_t fpdb_mutex;
 
 		/*
 			Check if this is uninitialised at this point and initialise if so.  This saves us copying
@@ -257,7 +288,7 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 		tcp = (struct tcp_header*)(packet + SIZE_ETHERNET + size_vlan_offset + size_ip);
 
 		/* IS THIS MY SHARD? */
-		if(shard_num(tcp->th_sport, tcp->th_dport, SHARDNUM) == my_shard) {
+		if(shard_num(tcp->th_sport, tcp->th_dport, SHARDNUM) == (uint) args) {
 			//printf("Mine: %i\n", my_shard);
 		} else {
 			//printf("Someone Else %i\n", my_shard);
@@ -580,6 +611,7 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 
 					/* Whole criteria match.... woo! */
 					matchcount++;
+					pthread_mutex_lock(&log_mutex);
 					fprintf(stdout, "[%s] Fingerprint Matched: \"%.*s\" %s connection from %s:%i to ", printable_time, fp_nav->desc_length ,fp_nav->desc, ssl_version(fp_nav->tls_version),
 						src_address_buffer, ntohs(tcp->th_sport));
 					fprintf(stdout, "%s:%i ", dst_address_buffer, ntohs(tcp->th_dport));
@@ -600,6 +632,7 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 
 						fprintf(stdout, "(Multiple Match)");
 					fprintf(stdout, "\n");
+					pthread_mutex_unlock(&log_mutex);
 			} else {
 				// Fuzzy Match goes here (if we ever want it)
 
@@ -669,7 +702,7 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 			memcpy(fp_packet->sig_alg, realsig_alg, fp_packet->sig_alg_length);
 			memcpy(fp_packet->ec_point_fmt, realec_point_fmt, fp_packet->ec_point_fmt_length);
 
-
+			pthread_mutex_lock(&log_mutex);
 			printf("[%s] New FingerPrint [%i] Detected, dynamically adding to in-memory fingerprint database\n", printable_time, newsig_count++);
 			fp_nav = fp_packet;	// Temporarily just point one thing to another for testing.
 
@@ -677,8 +710,9 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 			/*
 				Insert fingerprint as first in it's "list"
 			*/
+			//pthread_mutex_lock(&search[((fp_packet->ciphersuite_length & 0x000F) >> 1 )][((fp_packet->tls_version) & 0x00FF)]->fpdb_mutex);
 			search[((fp_packet->ciphersuite_length & 0x000F) >> 1 )][((fp_packet->tls_version) & 0x00FF)] = fp_packet;
-
+			//pthread_mutex_unlock(&search[((fp_packet->ciphersuite_length & 0x000F) >> 1 )][((fp_packet->tls_version) & 0x00FF)]->fpdb_mutex);
 
 			/* If selected output in the normal stream */
 
@@ -695,10 +729,12 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 				printf("Not Set");
 			}
 			printf("\"\n");
+			pthread_mutex_unlock(&log_mutex);
 
 
 			// Should just for json_fd being /dev/null and skip .. optimisation...
 			// or make an output function linked list XXX
+			pthread_mutex_lock(&json_mutex);
 			fprintf(json_fd, "{\"id\": %i, \"desc\": \"", fp_packet->fingerprint_id);
 			fprintf(json_fd, "%s\", ", fp_packet->desc);
 			fprintf(json_fd, "\"record_tls_version\": \"0x%.04X\", ", fp_packet->record_tls_version);
@@ -796,6 +832,7 @@ void got_packet(u_char *args, const struct pcap_pkthdr *pcap_header, const u_cha
 			}
 
 			fprintf(json_fd, "}\n");
+			pthread_mutex_unlock(&json_mutex);
 			/* **************************** */
 			/* END OF RECORD - OR SOMETHING */
 			/* **************************** */

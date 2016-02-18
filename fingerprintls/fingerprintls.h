@@ -37,7 +37,7 @@ mistakes, kthnxbai.
 	Because I'm going quick and dirty on the hashing algorithm, the number of shards
 	has to be an all 1's number in binary (2, 4, 8, etc).
 */
-#define SHARDNUM 4
+#define SHARDNUM 2
 
 
 /* Ethernet addresses are 6 bytes */
@@ -169,8 +169,24 @@ struct fingerprint_new {
   uint16_t  ec_point_fmt_length;
   uint8_t   *ec_point_fmt;
   struct    fingerprint_new  *next;
+  pthread_mutex_t fpdb_mutex;          /* for locking this FP down the chain */
 };
 
+/* pthreads only allow a single argument to be passed, the thread number, so we'll create an array of these
+   the thread can look up it's corresponding "number" in the array and obtain it's own config options */
+
+struct pthread_config {
+  struct pthread_config *next;
+  uint8_t threadnum;
+  pcap_t *handle;
+  pthread_t thread_handle;
+  pthread_mutex_t thread_mutex;
+//  struct bpf_program fp;
+} *pthread_config_ptr;
+
+pthread_mutex_t log_mutex;
+pthread_mutex_t json_mutex;
+pthread_mutex_t fpdb_mutex;
 
 /* This works perfectly well for TLS, but does not catch horrible SSLv2 packets, soooooo.... */
 //char *default_filter = "tcp[tcp[12]/16*4]=22 and (tcp[tcp[12]/16*4+5]=1) and (tcp[tcp[12]/16*4+9]=3) and (tcp[tcp[12]/16*4+1]=3) and (tcp[tcp[12]/16*4+43]=0)";
